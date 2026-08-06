@@ -1,0 +1,150 @@
+name: morning
+
+# Telemetry brief. Reads production numbers and the open work, writes one short
+# brief, sends it, and stops. No code changes come out of this cycle.
+on:
+  schedule:
+    # 12:07 UTC. Cron on GitHub is always UTC and there is no DST handling, so
+    # pick the offset you want in winter and accept the hour of drift in summer.
+    # The :07 is not decoration. Scheduled runs are queued on a shared pool and
+    # the top of the hour is the busiest slot on the platform, where runs arrive
+    # late or get dropped entirely. Seven minutes past is empty.
+    - cron: "7 12 * * *"
+  workflow_dispatch: {}
+
+# One run at a time, and never cancel a run in flight: a cancelled cycle leaves
+# half written state and its failure alert never fires.
+concurrency:
+  group: morning
+  cancel-in-progress: false
+
+permissions:
+  contents: write
+
+env:
+  CYCLE: morning
+
+jobs:
+  cycle:
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
+        with:
+          # Full history. Anything that reasons about what shipped when needs
+          # more than the single commit a shallow clone gives you.
+          fetch-depth: 0
+          persist-credentials: false
+
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4.4.0
+        with:
+          node-version: 22
+
+      - run: npm install -g @anthropic-ai/claude-code
+
+      - name: Budget preflight
+        id: budget
+        env:
+          BUDGET_MONTHLY: ${{ vars.BUDGET_MONTHLY }}
+          KILL_SWITCH: ${{ vars.KILL_SWITCH }}
+        run: |
+          set +e
+          node scripts/record-run.mjs --preflight
+          code=$?
+          echo "code=$code" >> "$GITHUB_OUTPUT"
+          exit $code
+
+      - name: Run the cycle
+        id: agent
+        env:
+          # Subscription auth from `claude setup-token`, or fall back to a key.
+          CLAUDE_CODE_OAUTH_TOKEN: ${{ secrets.CLAUDE_CODE_OAUTH_TOKEN }}
+          ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
+          # Read only credentials for telemetry. This cycle never needs write.
+          TELEMETRY_DATABASE_URL: ${{ secrets.TELEMETRY_DATABASE_URL }}
+          GH_TOKEN: ${{ secrets.GH_TOKEN_READONLY }}
+          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+          TARGET_REPO: ${{ vars.TARGET_REPO }}
+          BUDGET_MONTHLY: ${{ vars.BUDGET_MONTHLY }}
+          RUNNER_MAX_USD: ${{ vars.RUNNER_MAX_USD }}
+          # Sends are off until you turn them on, deliberately.
+          DRY_RUN: ${{ vars.DRY_RUN || '1' }}
+          POSTURE: ${{ steps.budget.outputs.posture }}
+          MODEL: ${{ vars.MORNING_MODEL || 'sonnet' }}
+        run: |
+          set +e
+          CHARTER="charters/${CYCLE}.md"
+          if [ ! -f "$CHARTER" ]; then
+            echo "::error::$CHARTER is missing. Copy charters/nightly-dev.md and rewrite it for this cycle."
+            exit 1
+          fi
+          cat > prompt.txt <<'EOF'
+          Run the morning telemetry brief.
+
+          1. Read state/ for what the last cycles left behind: open items, anything
+             you promised to check today, anything still waiting on a human.
+          2. Pull the numbers you are allowed to pull. Use the read only database
+             role and the public API surfaces named in your charter. Record what
+             each number is as of, not just the number.
+          3. Compare against the last brief. Say what moved and by how much. If a
+             number did not move, say that too.
+          4. Write state/briefs/<today>.md: the state of things in one paragraph,
+             then what changed, then what needs a decision from a human today.
+             Anything you could not verify goes under a heading that says so.
+          5. Send the brief with: node scripts/approve-card.mjs --text "$(cat state/briefs/<today>.md)"
+
+          You do not open pull requests in this cycle and you do not send anything
+          to a customer. If something looks broken, write it down for the triage
+          cycle this afternoon.
+          EOF
+          claude -p "$(cat prompt.txt)" \
+            --append-system-prompt "$(cat "$CHARTER")" \
+            --model "$MODEL" \
+            --max-turns 60 \
+            --output-format json \
+            --allowedTools "Read,Write,Edit,Glob,Grep,Bash,WebFetch,TodoWrite" > run.json
+          agent_code=$?
+          node scripts/record-run.mjs --label "$CYCLE" < run.json
+          cost_code=$?
+          if [ "$agent_code" -ne 0 ]; then code=$agent_code; else code=$cost_code; fi
+          echo "exit_code=$code" >> "$GITHUB_OUTPUT"
+          exit $code
+
+      - name: Persist state
+        if: always() && vars.PERSIST_STATE == '1'
+        run: |
+          git config user.name "agent-ops[bot]"
+          git config user.email "agent-ops@users.noreply.github.com"
+          mkdir -p state
+          git add -f state/
+          git diff --cached --quiet && exit 0
+          git commit -m "cycle: ${CYCLE} $(date -u +%F)"
+          REMOTE="https://x-access-token:${{ github.token }}@github.com/${{ github.repository }}.git"
+          for _ in 1 2 3 4 5; do
+            git fetch -q "$REMOTE" ${{ github.ref_name }} \
+              && git merge --no-edit FETCH_HEAD \
+              && git push "$REMOTE" HEAD:${{ github.ref_name }} && exit 0
+            git merge --abort 2>/dev/null || true
+            sleep 3
+          done
+          echo "::error::state push failed after 5 attempts"
+          exit 1
+
+      - name: Alert on failure
+        if: failure() || cancelled()
+        env:
+          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+          DRY_RUN: "0"
+        run: |
+          url="${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}"
+          agent_code="${{ steps.agent.outputs.exit_code }}"
+          budget_code="${{ steps.budget.outputs.code }}"
+          code="${agent_code:-$budget_code}"
+          case "$code" in
+            78) msg="morning cycle did not start: monthly cap or kill switch. $url" ;;
+            79) msg="morning cycle finished its work then crossed the per run cost cap. Designed stop, not a break. $url" ;;
+            *)  msg="morning cycle failed. $url" ;;
+          esac
+          node scripts/approve-card.mjs --text "$msg"

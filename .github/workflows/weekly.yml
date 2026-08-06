@@ -1,0 +1,147 @@
+name: weekly
+
+# Strategy. Once a week the agent reads its own week back: what it shipped, what
+# it proposed and got rejected, what it keeps re-discovering, what it spent. The
+# output is a short memo and, when it earns one, a proposed change to its own
+# charters. Charter changes are approvals like anything else.
+on:
+  schedule:
+    # 16:07 UTC Sunday. A weekly job that lands on a congested slot and gets
+    # skipped costs a whole week, so the offset matters more here than anywhere.
+    - cron: "7 16 * * 0"
+  workflow_dispatch: {}
+
+concurrency:
+  group: weekly
+  cancel-in-progress: false
+
+permissions:
+  contents: write
+
+env:
+  CYCLE: weekly
+
+jobs:
+  cycle:
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
+        with:
+          # The whole point of this cycle is reasoning over history. A shallow
+          # clone gives it one commit and it will fill the rest in from
+          # imagination.
+          fetch-depth: 0
+          persist-credentials: false
+
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4.4.0
+        with:
+          node-version: 22
+
+      - run: npm install -g @anthropic-ai/claude-code
+
+      - name: Budget preflight
+        id: budget
+        env:
+          BUDGET_MONTHLY: ${{ vars.BUDGET_MONTHLY }}
+          KILL_SWITCH: ${{ vars.KILL_SWITCH }}
+        run: |
+          set +e
+          node scripts/record-run.mjs --preflight
+          code=$?
+          echo "code=$code" >> "$GITHUB_OUTPUT"
+          exit $code
+
+      - name: Run the cycle
+        id: agent
+        env:
+          CLAUDE_CODE_OAUTH_TOKEN: ${{ secrets.CLAUDE_CODE_OAUTH_TOKEN }}
+          ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
+          TELEMETRY_DATABASE_URL: ${{ secrets.TELEMETRY_DATABASE_URL }}
+          GH_TOKEN: ${{ secrets.GH_TOKEN_READONLY }}
+          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+          TARGET_REPO: ${{ vars.TARGET_REPO }}
+          BUDGET_MONTHLY: ${{ vars.BUDGET_MONTHLY }}
+          RUNNER_MAX_USD: ${{ vars.RUNNER_MAX_USD }}
+          DRY_RUN: ${{ vars.DRY_RUN || '1' }}
+          POSTURE: ${{ steps.budget.outputs.posture }}
+          MODEL: ${{ vars.WEEKLY_MODEL || 'opus' }}
+        run: |
+          set +e
+          CHARTER="charters/${CYCLE}.md"
+          if [ ! -f "$CHARTER" ]; then
+            echo "::error::$CHARTER is missing. Copy charters/nightly-dev.md and rewrite it for this cycle."
+            exit 1
+          fi
+          cat > prompt.txt <<'EOF'
+          Run the weekly strategy session.
+
+          1. Read the last seven days of state/: briefs, triage notes, approvals and
+             what happened to each one, and the spend ledger.
+          2. Answer four questions with evidence, not impressions.
+             What shipped, and did it do what the approval card said it would?
+             What got rejected, and what does the pattern of rejections tell you
+             about the judgement you are applying?
+             What did you re-discover this week that you already knew last week?
+             What did the week cost, and was it worth that?
+          3. Anything you re-discovered belongs in a charter. Draft the exact edit
+             as a diff against the charter file. Charter edits go through approval
+             like any other change, because they are the thing that governs you.
+          4. Write state/weekly/<date>.md. Short. A human reads this one closely,
+             so length is not a proxy for value.
+          5. Send it: node scripts/approve-card.mjs --text "$(cat state/weekly/<date>.md)"
+
+          Do not propose a new cycle, a new integration, or a new capability. This
+          session is about doing the existing job better.
+          EOF
+          claude -p "$(cat prompt.txt)" \
+            --append-system-prompt "$(cat "$CHARTER")" \
+            --model "$MODEL" \
+            --max-turns 120 \
+            --output-format json \
+            --allowedTools "Read,Write,Edit,Glob,Grep,Bash,WebFetch,TodoWrite" > run.json
+          agent_code=$?
+          node scripts/record-run.mjs --label "$CYCLE" < run.json
+          cost_code=$?
+          if [ "$agent_code" -ne 0 ]; then code=$agent_code; else code=$cost_code; fi
+          echo "exit_code=$code" >> "$GITHUB_OUTPUT"
+          exit $code
+
+      - name: Persist state
+        if: always() && vars.PERSIST_STATE == '1'
+        run: |
+          git config user.name "agent-ops[bot]"
+          git config user.email "agent-ops@users.noreply.github.com"
+          mkdir -p state
+          git add -f state/
+          git diff --cached --quiet && exit 0
+          git commit -m "cycle: ${CYCLE} $(date -u +%F)"
+          REMOTE="https://x-access-token:${{ github.token }}@github.com/${{ github.repository }}.git"
+          for _ in 1 2 3 4 5; do
+            git fetch -q "$REMOTE" ${{ github.ref_name }} \
+              && git merge --no-edit FETCH_HEAD \
+              && git push "$REMOTE" HEAD:${{ github.ref_name }} && exit 0
+            git merge --abort 2>/dev/null || true
+            sleep 3
+          done
+          echo "::error::state push failed after 5 attempts"
+          exit 1
+
+      - name: Alert on failure
+        if: failure() || cancelled()
+        env:
+          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+          DRY_RUN: "0"
+        run: |
+          url="${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}"
+          agent_code="${{ steps.agent.outputs.exit_code }}"
+          budget_code="${{ steps.budget.outputs.code }}"
+          code="${agent_code:-$budget_code}"
+          case "$code" in
+            78) msg="weekly strategy did not start: monthly cap or kill switch. $url" ;;
+            79) msg="weekly strategy finished its work then crossed the per run cost cap. Designed stop, not a break. $url" ;;
+            *)  msg="weekly strategy failed. $url" ;;
+          esac
+          node scripts/approve-card.mjs --text "$msg"

@@ -1,0 +1,166 @@
+name: nightly-dev
+
+# The only cycle that writes code. It picks one item, fixes it on a branch,
+# proves it, runs the skeptic over the diff, opens a pull request, and files an
+# approval card. It never merges. Merging is the executor's job and only after
+# a tap.
+on:
+  schedule:
+    # 06:07 UTC, nights after a working day. Off the top of the hour: scheduled
+    # runs are queued on a shared pool and the :00 slot is where they get
+    # delayed or silently skipped.
+    - cron: "7 6 * * 2-6"
+  workflow_dispatch: {}
+
+concurrency:
+  group: nightly-dev
+  cancel-in-progress: false
+
+permissions:
+  contents: write
+
+env:
+  CYCLE: nightly-dev
+
+jobs:
+  cycle:
+    runs-on: ubuntu-latest
+    # Generous, because a real fix includes running the target repo's test
+    # suite. The timeout is the outer bound; the cost cap is the real one.
+    timeout-minutes: 120
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4.4.0
+        with:
+          node-version: 22
+
+      - run: npm install -g @anthropic-ai/claude-code
+
+      - name: Budget preflight
+        id: budget
+        env:
+          BUDGET_MONTHLY: ${{ vars.BUDGET_MONTHLY }}
+          KILL_SWITCH: ${{ vars.KILL_SWITCH }}
+        run: |
+          set +e
+          node scripts/record-run.mjs --preflight
+          code=$?
+          echo "code=$code" >> "$GITHUB_OUTPUT"
+          exit $code
+
+      - name: Clone the target repo
+        env:
+          GH_TOKEN_WRITE: ${{ secrets.GH_TOKEN_WRITE }}
+        run: |
+          # Full clone. A depth 1 clone cannot answer "when did this break" or
+          # "what else touched this file", and an agent that cannot see history
+          # will confidently invent it.
+          git clone --quiet "https://x-access-token:${GH_TOKEN_WRITE}@github.com/${{ vars.TARGET_REPO }}.git" target
+          git -C target config user.name "agent-ops[bot]"
+          git -C target config user.email "agent-ops@users.noreply.github.com"
+
+      - name: Run the cycle
+        id: agent
+        env:
+          CLAUDE_CODE_OAUTH_TOKEN: ${{ secrets.CLAUDE_CODE_OAUTH_TOKEN }}
+          ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
+          TELEMETRY_DATABASE_URL: ${{ secrets.TELEMETRY_DATABASE_URL }}
+          # Branch push and pull request creation need write. Merging does not
+          # happen here at all, and branch protection on the default branch is
+          # what makes that a rule rather than a promise.
+          GH_TOKEN: ${{ secrets.GH_TOKEN_WRITE }}
+          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+          TARGET_REPO: ${{ vars.TARGET_REPO }}
+          DEFAULT_BRANCH: ${{ vars.DEFAULT_BRANCH || 'main' }}
+          BUDGET_MONTHLY: ${{ vars.BUDGET_MONTHLY }}
+          RUNNER_MAX_USD: ${{ vars.RUNNER_MAX_USD }}
+          DRY_RUN: ${{ vars.DRY_RUN || '1' }}
+          POSTURE: ${{ steps.budget.outputs.posture }}
+          MODEL: ${{ vars.NIGHTLY_MODEL || 'opus' }}
+        run: |
+          set +e
+          CHARTER="charters/${CYCLE}.md"
+          if [ ! -f "$CHARTER" ]; then
+            echo "::error::$CHARTER is missing. Copy charters/nightly-dev.md and rewrite it for this cycle."
+            exit 1
+          fi
+          cat > prompt.txt <<'EOF'
+          Run the nightly dev cycle against the clone in target/.
+
+          1. Pick exactly one item from what triage handed you. Smallest thing that
+             is genuinely worth doing. If nothing qualifies, say so, write it down,
+             and stop. A cycle that ships nothing is a fine outcome.
+          2. Reproduce the problem before you touch anything. A failing test is the
+             best reproduction. If you cannot reproduce it, you cannot claim you
+             fixed it, so write down what you tried and stop.
+          3. Branch from the default branch, never from another open branch, and
+             never from another open pull request's head.
+          4. Fix it. Climb the verification ladder in your charter and record the
+             actual command output for each rung, not a summary of it.
+          5. Push the branch and open a pull request. The body says what changed,
+             what you ran, what you could not verify, and how to undo it.
+          6. Run the skeptic over the diff:
+             node scripts/skeptic.mjs --pr "$TARGET_REPO#<number>" --context "nightly fix"
+             A BLOCK means you do not file an approval. Fix it or drop it.
+          7. Write the approval record described in charters/README.md, with the
+             exact 40 character head sha of the branch as pushed, then send it:
+             node scripts/approve-card.mjs <path>
+
+          You do not merge. You do not touch the default branch. If the change grew
+          past what one review can hold, split it or drop it.
+          EOF
+          claude -p "$(cat prompt.txt)" \
+            --append-system-prompt "$(cat "$CHARTER")" \
+            --model "$MODEL" \
+            --max-turns 200 \
+            --output-format json \
+            --allowedTools "Read,Write,Edit,Glob,Grep,Bash,Task,WebFetch,TodoWrite" > run.json
+          agent_code=$?
+          node scripts/record-run.mjs --label "$CYCLE" < run.json
+          cost_code=$?
+          if [ "$agent_code" -ne 0 ]; then code=$agent_code; else code=$cost_code; fi
+          echo "exit_code=$code" >> "$GITHUB_OUTPUT"
+          exit $code
+
+      - name: Persist state
+        if: always() && vars.PERSIST_STATE == '1'
+        run: |
+          git config user.name "agent-ops[bot]"
+          git config user.email "agent-ops@users.noreply.github.com"
+          mkdir -p state
+          git add -f state/
+          git diff --cached --quiet && exit 0
+          git commit -m "cycle: ${CYCLE} $(date -u +%F)"
+          REMOTE="https://x-access-token:${{ github.token }}@github.com/${{ github.repository }}.git"
+          for _ in 1 2 3 4 5; do
+            git fetch -q "$REMOTE" ${{ github.ref_name }} \
+              && git merge --no-edit FETCH_HEAD \
+              && git push "$REMOTE" HEAD:${{ github.ref_name }} && exit 0
+            git merge --abort 2>/dev/null || true
+            sleep 3
+          done
+          echo "::error::state push failed after 5 attempts"
+          exit 1
+
+      - name: Alert on failure
+        if: failure() || cancelled()
+        env:
+          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+          DRY_RUN: "0"
+        run: |
+          url="${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}"
+          agent_code="${{ steps.agent.outputs.exit_code }}"
+          budget_code="${{ steps.budget.outputs.code }}"
+          code="${agent_code:-$budget_code}"
+          case "$code" in
+            78) msg="nightly dev did not start: monthly cap or kill switch. $url" ;;
+            79) msg="nightly dev finished its work then crossed the per run cost cap. Designed stop, not a break. $url" ;;
+            *)  msg="nightly dev failed. $url" ;;
+          esac
+          node scripts/approve-card.mjs --text "$msg"

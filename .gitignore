@@ -1,0 +1,21 @@
+# The agent's memory and its cost ledger. Local by default: the sample state in
+# a template is noise, and real state is business detail you may not want in a
+# public repo. Set the PERSIST_STATE variable and this ignore rule is bypassed
+# by the workflows with `git add -f state/`.
+state/
+
+# Secrets.
+.env
+.env.*
+!.env.example
+
+# Ledgers and per run scratch files.
+*.jsonl
+run.json
+prompt.txt
+
+# A clone of the repository the agent works on, made fresh each run.
+target/
+
+node_modules/
+.DS_Store

@@ -1,0 +1,150 @@
+name: afternoon
+
+# Triage. Reads what broke or drifted since the brief, decides what is worth a
+# human's attention, and files at most a couple of approvals. Weekdays only.
+on:
+  schedule:
+    # 19:07 UTC, weekdays. Seven past the hour because the top of the hour is
+    # the congested slot on the shared scheduler and runs there arrive late or
+    # not at all.
+    - cron: "7 19 * * 1-5"
+  workflow_dispatch: {}
+
+concurrency:
+  group: afternoon
+  cancel-in-progress: false
+
+permissions:
+  contents: write
+
+env:
+  CYCLE: afternoon
+
+jobs:
+  cycle:
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4.4.0
+        with:
+          node-version: 22
+
+      - run: npm install -g @anthropic-ai/claude-code
+
+      - name: Budget preflight
+        id: budget
+        env:
+          BUDGET_MONTHLY: ${{ vars.BUDGET_MONTHLY }}
+          KILL_SWITCH: ${{ vars.KILL_SWITCH }}
+        run: |
+          set +e
+          node scripts/record-run.mjs --preflight
+          code=$?
+          echo "code=$code" >> "$GITHUB_OUTPUT"
+          exit $code
+
+      - name: Clone the target repo for read only context
+        env:
+          GH_TOKEN_READONLY: ${{ secrets.GH_TOKEN_READONLY }}
+        run: |
+          git clone --quiet "https://x-access-token:${GH_TOKEN_READONLY}@github.com/${{ vars.TARGET_REPO }}.git" target
+          # Strip the credential from the clone on disk. The agent gets the code,
+          # not the ability to push it.
+          git -C target remote set-url origin "https://github.com/${{ vars.TARGET_REPO }}.git"
+
+      - name: Run the cycle
+        id: agent
+        env:
+          CLAUDE_CODE_OAUTH_TOKEN: ${{ secrets.CLAUDE_CODE_OAUTH_TOKEN }}
+          ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
+          TELEMETRY_DATABASE_URL: ${{ secrets.TELEMETRY_DATABASE_URL }}
+          GH_TOKEN: ${{ secrets.GH_TOKEN_READONLY }}
+          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+          TARGET_REPO: ${{ vars.TARGET_REPO }}
+          BUDGET_MONTHLY: ${{ vars.BUDGET_MONTHLY }}
+          RUNNER_MAX_USD: ${{ vars.RUNNER_MAX_USD }}
+          DRY_RUN: ${{ vars.DRY_RUN || '1' }}
+          POSTURE: ${{ steps.budget.outputs.posture }}
+          MODEL: ${{ vars.AFTERNOON_MODEL || 'sonnet' }}
+        run: |
+          set +e
+          CHARTER="charters/${CYCLE}.md"
+          if [ ! -f "$CHARTER" ]; then
+            echo "::error::$CHARTER is missing. Copy charters/nightly-dev.md and rewrite it for this cycle."
+            exit 1
+          fi
+          cat > prompt.txt <<'EOF'
+          Run the afternoon triage cycle.
+
+          1. Read this morning's brief and anything the last nightly run left open.
+          2. Look at what is actually failing right now: error tracker, failed jobs,
+             anything a customer would notice. Group by cause, not by count. Ten
+             reports of one broken page are one problem.
+          3. Rank by who it hurts and how reversible it is. Cheap and reversible you
+             can hand to tonight's dev cycle. Expensive or irreversible needs a
+             human, today, with a real recommendation attached.
+          4. Write state/triage/<today>.md with what you found, what you are handing
+             to the dev cycle, and what you are escalating.
+          5. For anything needing a decision, write the approval record described in
+             charters/README.md and send it: node scripts/approve-card.mjs <path>
+
+          File at most two approvals in one run. If a third comes up, the ranking is
+          wrong or the day is genuinely on fire, and either way a human should hear
+          that in plain words rather than get a third card.
+          EOF
+          claude -p "$(cat prompt.txt)" \
+            --append-system-prompt "$(cat "$CHARTER")" \
+            --model "$MODEL" \
+            --max-turns 80 \
+            --output-format json \
+            --allowedTools "Read,Write,Edit,Glob,Grep,Bash,WebFetch,TodoWrite" > run.json
+          agent_code=$?
+          node scripts/record-run.mjs --label "$CYCLE" < run.json
+          cost_code=$?
+          if [ "$agent_code" -ne 0 ]; then code=$agent_code; else code=$cost_code; fi
+          echo "exit_code=$code" >> "$GITHUB_OUTPUT"
+          exit $code
+
+      - name: Persist state
+        if: always() && vars.PERSIST_STATE == '1'
+        run: |
+          git config user.name "agent-ops[bot]"
+          git config user.email "agent-ops@users.noreply.github.com"
+          mkdir -p state
+          git add -f state/
+          git diff --cached --quiet && exit 0
+          git commit -m "cycle: ${CYCLE} $(date -u +%F)"
+          REMOTE="https://x-access-token:${{ github.token }}@github.com/${{ github.repository }}.git"
+          for _ in 1 2 3 4 5; do
+            git fetch -q "$REMOTE" ${{ github.ref_name }} \
+              && git merge --no-edit FETCH_HEAD \
+              && git push "$REMOTE" HEAD:${{ github.ref_name }} && exit 0
+            git merge --abort 2>/dev/null || true
+            sleep 3
+          done
+          echo "::error::state push failed after 5 attempts"
+          exit 1
+
+      - name: Alert on failure
+        if: failure() || cancelled()
+        env:
+          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+          DRY_RUN: "0"
+        run: |
+          url="${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}"
+          agent_code="${{ steps.agent.outputs.exit_code }}"
+          budget_code="${{ steps.budget.outputs.code }}"
+          code="${agent_code:-$budget_code}"
+          case "$code" in
+            78) msg="afternoon triage did not start: monthly cap or kill switch. $url" ;;
+            79) msg="afternoon triage finished its work then crossed the per run cost cap. Designed stop, not a break. $url" ;;
+            *)  msg="afternoon triage failed. $url" ;;
+          esac
+          node scripts/approve-card.mjs --text "$msg"

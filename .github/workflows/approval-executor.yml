@@ -1,0 +1,75 @@
+name: approval-executor
+
+# Fires when the bridge turns a tap into a repository_dispatch. This is the one
+# workflow with a write token pointed at the target repository, and the only
+# path from a human decision to a merge.
+#
+# Everything it does is a check before a single API call:
+#   payload is well formed and the repo is on the allowlist
+#   the pull request is open, not a draft, and based on the default branch
+#   the head sha still equals the sha printed on the card
+#   the merge itself carries that sha, so GitHub refuses it if the head moved
+#     between the check and the call
+#
+# Any of those failing means nothing merges and the phone gets told why.
+on:
+  repository_dispatch:
+    types: [approval-decision]
+
+# Per approval, not global. Two different approvals must never cancel each
+# other, and a duplicate tap on the same approval dedupes harmlessly.
+concurrency:
+  group: executor-${{ github.event.client_payload.approval_id }}
+  cancel-in-progress: false
+
+# This repo's own contents are read only here. Write access to the target repo
+# comes from a separate token, scoped to that repo alone.
+permissions:
+  contents: read
+
+jobs:
+  execute:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
+        with:
+          persist-credentials: false
+
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4.4.0
+        with:
+          node-version: 22
+
+      - name: Merge the approved sha, or nothing
+        env:
+          # Straight from the dispatch payload. The executor validates every one
+          # of these before it uses them; a payload is an input, not a fact.
+          APPROVAL_ID: ${{ github.event.client_payload.approval_id }}
+          DECISION: ${{ github.event.client_payload.decision }}
+          REPO: ${{ github.event.client_payload.repo }}
+          PR_NUMBER: ${{ github.event.client_payload.pr_number }}
+          HEAD_SHA: ${{ github.event.client_payload.head_sha }}
+
+          GH_TOKEN_WRITE: ${{ secrets.GH_TOKEN_WRITE }}
+          ALLOWED_REPOS: ${{ vars.ALLOWED_REPOS || vars.TARGET_REPO }}
+          DEFAULT_BRANCH: ${{ vars.DEFAULT_BRANCH || 'main' }}
+          MERGE_MODE: ${{ vars.MERGE_MODE || 'api' }}
+          MERGE_METHOD: ${{ vars.MERGE_METHOD || 'squash' }}
+
+          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+
+          # A tap is the human authorization, so this workflow has its own dry
+          # run switch. Leaving it tied to the cycles' DRY_RUN would mean an
+          # approved change silently does nothing.
+          DRY_RUN: ${{ vars.EXECUTOR_DRY_RUN || '1' }}
+        run: node scripts/executor.mjs
+
+      - name: Alert on failure
+        if: failure() || cancelled()
+        env:
+          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+          DRY_RUN: "0"
+        run: |
+          node scripts/approve-card.mjs --text "executor run for ${{ github.event.client_payload.approval_id }} failed. Nothing was merged. ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}"
