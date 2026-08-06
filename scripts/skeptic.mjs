@@ -31,6 +31,7 @@ const PROMPT = [
   "You were not involved, you get no credit if it ships, and you are not being asked to be kind.",
   "Red team it: false or unverifiable claims, logic that does not hold, security and privacy exposure,",
   "irreversible or high blast radius actions, missing tests around the exact behaviour that changed,",
+  "AI-writing tells if the artifact is outward-facing prose (word-level and structural, per charters/prose.md),",
   "and anything an owner would regret waking up to.",
   "Judge only what is in front of you. Do not assume unseen context makes it fine.",
   'Reply with exactly one line "VERDICT: PASS|CONCERNS|BLOCK" followed by at most six short bullets, each naming a specific thing.',

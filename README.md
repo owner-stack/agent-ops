@@ -281,6 +281,21 @@ credential in a file under `$RUNNER_TEMP` before the agent starts, and
 `skeptic.mjs` re-reads it when its environment is bare. The scrub strips
 variables. It cannot reach the disk.
 
+## The prose gate
+
+Everything above guards changes to code. Text that leaves the company — blog
+posts, campaign emails, public replies — has its own failure mode: it reads
+like a model wrote it, because one did. The famous word-level tells are the
+weak signal; the durable fingerprint is structural, and structure alone
+separates AI text from human text at roughly 93% accuracy. So outbound prose
+clears two passes before the skeptic reads it: the word-level sweep, then the
+five structural audits in [charters/prose.md](charters/prose.md), with
+`node scripts/prose-scan.mjs --strict` as the deterministic backstop for the
+grep-able slice. The skeptic's mandate names the same audits, so the writer
+and the reviewer are held to one standard. Internal briefs and approval cards
+skip all of it — the person reading those hired an agent and does not need
+its writing disguised.
+
 ## Layout
 
 ```
@@ -293,11 +308,13 @@ variables. It cannot reach the disk.
 scripts/
   approve-card.mjs        builds the card, chunks it, checks the response
   executor.mjs            sha verification and merge
+  prose-scan.mjs          structural AI-tell scan for outbound prose
   record-run.mjs          cost ledger, per run cap, monthly kill switch
   skeptic.mjs             fresh context review with a forced verdict
 charters/
   README.md               what a charter is and the approval record shape
   nightly-dev.md          the worked example, copy it for the other cycles
+  prose.md                the two-pass gate for anything outbound
 state/                    the agent's memory, gitignored by default
 ```
 
