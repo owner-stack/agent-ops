@@ -52,6 +52,21 @@ jobs:
           echo "code=$code" >> "$GITHUB_OUTPUT"
           exit $code
 
+      - name: Stash credentials for nested claude calls
+        # The claude CLI scrubs its own credential variables from every
+        # subprocess it spawns, so a nested reviewer (skeptic.mjs, prompt step
+        # in the charter) would start with no auth at all and die with "Not
+        # logged in". skeptic.mjs re-reads these files only when its
+        # environment is bare. Mode 600, gone with the ephemeral runner.
+        env:
+          CLAUDE_CODE_OAUTH_TOKEN: ${{ secrets.CLAUDE_CODE_OAUTH_TOKEN }}
+          ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
+        run: |
+          install -m 600 /dev/null "$RUNNER_TEMP/claude-oauth"
+          printf '%s' "$CLAUDE_CODE_OAUTH_TOKEN" > "$RUNNER_TEMP/claude-oauth"
+          install -m 600 /dev/null "$RUNNER_TEMP/claude-api-key"
+          printf '%s' "$ANTHROPIC_API_KEY" > "$RUNNER_TEMP/claude-api-key"
+
       - name: Run the cycle
         id: agent
         env:

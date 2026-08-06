@@ -270,6 +270,17 @@ after `-p`. A variadic flag such as `--allowedTools` placed between them will
 swallow a trailing positional prompt, and the CLI then sits waiting on stdin
 until the job timeout, having produced nothing.
 
+A second note that cost six cycles of dead reviews before it was root-caused.
+The skeptic is a `claude` process spawned from inside another `claude` process,
+and the CLI scrubs its own credential variables from every subprocess it
+starts. On a laptop you never notice, because the nested CLI falls back to the
+keychain. In CI there is no keychain, auth lives entirely in the environment,
+and the nested reviewer dies with "Not logged in" no matter what the workflow
+passed. The fix is one level of indirection: the workflow stashes the
+credential in a file under `$RUNNER_TEMP` before the agent starts, and
+`skeptic.mjs` re-reads it when its environment is bare. The scrub strips
+variables. It cannot reach the disk.
+
 ## Layout
 
 ```

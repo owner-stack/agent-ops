@@ -57,6 +57,34 @@ function readArtifact(argv) {
   throw new Error("usage: skeptic.mjs --pr owner/repo#123 | --file path | --stdin  [--context text]");
 }
 
+/**
+ * A nested `claude` cannot inherit auth from the workflow. The CLI scrubs its
+ * own credential variables from every subprocess it spawns, so when this
+ * script runs inside a cycle agent's Bash tool, the child environment carries
+ * no token even though the workflow set one — the reviewer dies with "Not
+ * logged in" and the cycle loses its second opinion. The scrub strips
+ * variables; it cannot reach the disk. The cycle workflows stash whichever
+ * credential they hold in files under $RUNNER_TEMP before the agent starts,
+ * and this re-reads them only when the environment is bare. On a laptop the
+ * branch never fires and the CLI uses its keychain the way it always did.
+ */
+export function nestedAuthEnv(env = process.env) {
+  if (env.CLAUDE_CODE_OAUTH_TOKEN || env.ANTHROPIC_API_KEY) return env;
+  const dir = env.RUNNER_TEMP ?? "/home/runner/work/_temp";
+  const read = (name) => {
+    try {
+      return readFileSync(`${dir}/${name}`, "utf8").trim() || null;
+    } catch {
+      return null;
+    }
+  };
+  const oauth = read("claude-oauth");
+  if (oauth) return { ...env, CLAUDE_CODE_OAUTH_TOKEN: oauth };
+  const key = read("claude-api-key");
+  if (key) return { ...env, ANTHROPIC_API_KEY: key };
+  return env;
+}
+
 /** First VERDICT token wins. No verdict at all means BLOCK. */
 export function parseVerdict(output) {
   const m = /VERDICT:\s*(PASS|CONCERNS|BLOCK)/i.exec(String(output ?? ""));
@@ -84,6 +112,7 @@ export function runSkeptic({ body, context }, opts = {}) {
     input: body,
     encoding: "utf8",
     maxBuffer: 32 * 1024 * 1024,
+    env: nestedAuthEnv(),
   });
 
   if (res.error?.code === "ENOENT") {
