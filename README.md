@@ -1,9 +1,12 @@
-# agent-ops
+# agent-ops — scheduled AI agent orchestration with human-in-the-loop approvals
 
-Run a scheduled AI agent company against your own repository, with human
-approval over Telegram.
+Run a scheduled AI agent company against your own repository: the Claude Code CLI on GitHub
+Actions cron, a second model reviewing every diff, and a human tap on your phone before
+anything merges.
 
-Four cron jobs on GitHub Actions. Each one wakes a coding agent with a written
+MIT. No dependencies. Node 20 or newer. Five workflows, five scripts.
+
+Four cycles, each on its own schedule. Each one wakes a coding agent with a written
 charter, a budget, and a narrow job. The agent reads production telemetry,
 triages what is broken, fixes one thing on a branch, and proposes it. Nothing
 reaches your default branch until a card arrives on your phone with a diff
@@ -154,48 +157,10 @@ Everything else the executor checks before it gets that far:
   request's head would merge that other pull request's commits along with it,
   and your card described only one of them.
 
-### The bridge
-
-Telegram needs somewhere to deliver taps. The bridge is the one piece not in
-this repo, because it belongs on whatever serverless host you already use, and
-it is small enough to write in one sitting. Its whole contract:
-
-```js
-// POST from Telegram. Reject anything that is not from you, turn a tap into a
-// repository_dispatch, and always answer 200 so Telegram stops retrying.
-export default async function handler(req, res) {
-  if (req.headers["x-telegram-bot-api-secret-token"] !== process.env.TELEGRAM_WEBHOOK_SECRET) {
-    return res.status(401).send("no");
-  }
-  const cb = req.body?.callback_query;
-  if (!cb) return res.status(200).send("ignored");
-  // The authorization model, in one line: one chat may approve.
-  if (String(cb.from?.id) !== process.env.TELEGRAM_CHAT_ID) return res.status(403).send("no");
-
-  const m = /^ao:v1:(approve|reject):([a-z0-9._-]{1,40})$/.exec(cb.data ?? "");
-  if (!m) return res.status(200).send("unrecognized");
-  const [, decision, approvalId] = m;
-
-  // Look up the approval record you stored when the card was sent, so the sha
-  // comes from your side rather than from the callback payload.
-  const approval = await loadApproval(approvalId);
-
-  await fetch(`https://api.github.com/repos/${process.env.HQ_REPO}/dispatches`, {
-    method: "POST",
-    headers: { authorization: `Bearer ${process.env.GH_TOKEN_DISPATCH}`, accept: "application/vnd.github+json" },
-    body: JSON.stringify({
-      event_type: "approval-decision",
-      client_payload: { approval_id: approvalId, decision, repo: approval.repo, pr_number: approval.pr_number, head_sha: approval.head_sha },
-    }),
-  });
-  res.status(200).send("dispatched");
-}
-```
-
-Two details worth keeping. Answer 200 even on a path you ignore, or Telegram
-retries the same update forever. And read the sha from your stored approval
-record rather than from `callback_data`, which only has 64 bytes to work with
-and should carry nothing but an id.
+Telegram needs somewhere to deliver taps. That piece is not in this repo, because
+it belongs on whatever serverless host you already use, and it is small enough to
+write in one sitting: [docs/bridge.md](docs/bridge.md) has the whole handler and
+the two details that bite.
 
 ## Governance
 
@@ -315,11 +280,14 @@ charters/
   README.md               what a charter is and the approval record shape
   nightly-dev.md          the worked example, copy it for the other cycles
   prose.md                the two-pass gate for anything outbound
+docs/
+  bridge.md               the Telegram webhook you host yourself
+  lessons.md              what went wrong in production, and what it changed
 state/                    the agent's memory, gitignored by default
 ```
 
-No dependencies. Node 20 or newer, global `fetch`, and `node:child_process`. The
-only install any workflow performs is the Claude Code CLI itself.
+Node 20 or newer, global `fetch`, and `node:child_process`. The only install any
+workflow performs is the Claude Code CLI itself.
 
 ## Setup
 
@@ -341,7 +309,8 @@ only install any workflow performs is the Claude Code CLI itself.
    `EXECUTOR_DRY_RUN=1`. Optionally `PERSIST_STATE=1` if you want the agent's
    memory committed back to this repo, and the per cycle model overrides.
 
-5. **Stand up the bridge** and register the webhook with your secret:
+5. **Stand up the bridge** ([docs/bridge.md](docs/bridge.md)) and register the
+   webhook with your secret:
 
    ```
    curl -X POST "https://api.telegram.org/botYOUR_BOT_TOKEN/setWebhook" \
@@ -373,61 +342,21 @@ DRY_RUN=0 node scripts/approve-card.mjs card.json  # sends it for real
 
 ## Lessons that cost something
 
-**A notification path that cannot fail loudly will fail silently.** Telegram
-rejects any single message over 4096 characters. It answers with HTTP 200 and
-`{"ok": false, "description": "..."}` in the body, so a send that pipes the
-response to `/dev/null` cannot tell a delivered card from a dropped one. A long
-risk note is enough to cross the limit, and when it does, the whole card goes,
-buttons included. That failure looks identical to a quiet week: no card, no
-error, no tap, and the assumption that the agent simply had nothing to propose.
-It ran for days before anyone went looking. The fix is two lines of discipline.
-Chunk before sending, and parse the response body rather than the status code.
-`approve-card.mjs` does both, and falls back to the shortest card that can still
-carry a tap when the full one will not go through.
-
-**A status column that nothing writes to is not evidence.** An agent auditing a
-feature found a `verified` field, saw it on the record, and reported the feature
-working. Nothing in the codebase ever set that field. The audit was confident,
-specific, and wrong, and it was wrong in the most expensive direction, which is
-declaring something safe. Evidence is command output, a query result, or a
-request you actually made. A field that exists is a fact about the schema and
-says nothing about behavior. Charters carry this rule explicitly now, and the
-verification ladder asks for pasted output rather than a summary of it.
-
-**Never base a pull request on another open pull request's head.** It reads as
-efficient when the second change depends on the first. What it means is that
-merging the second one merges the first one too, including whatever was still
-being argued about in review, and your approval card described one of them. The
-executor refuses any pull request whose base is not the default branch, and the
-nightly charter forbids branching from anything else. If work genuinely depends
-on unmerged work, that is a reason to wait, not a reason to stack.
-
-**A depth 1 clone cannot reason about history.** Shallow clones are the sensible
-default for CI and the wrong default here. Ask an agent when a behavior changed,
-or what else touched a file, and with one commit of history it will answer
-anyway, from the shape of the code and its own confidence. `git log` returning
-almost nothing does not read as an error to a model, it reads as a small
-project. Clone at full depth for anything that reasons about the past, or
-unshallow before you ask.
-
-**Distinguish designed stops from crashes in the alert text.** Exit 78 for the
-monthly cap and 79 for the per run cap, with alerts that name them in plain
-words. When every stop looks like a fire, you stop reading the alerts, and then
-a real one arrives and does nothing.
-
-**Do not cancel a run in flight.** `cancel-in-progress: true` looks tidy on a
-scheduled workflow. A cancelled job runs zero further steps, including the
-failure alert, so the run that vanished is indistinguishable from the run that
-went fine.
+[docs/lessons.md](docs/lessons.md) is the incident list: a Telegram limit that
+dropped cards for days while looking exactly like a quiet week, an agent that
+declared a feature working because a status column existed, stacked pull
+requests that would have merged more than the card described, and why a depth 1
+clone makes a model confidently wrong about history. Every rule in the charters
+came from one of them.
 
 ## What this template does not include
 
-The bridge function, sketched above and yours to host. Any product specific
-telemetry, since the queries that matter are the ones about your own numbers.
-The rest of the agent roles you may want beyond the four cycles here. And a
-promise that this is safe to point at production on day one, which is what the
-dry run defaults, the branch protection step, and the read only database role
-are all there to earn.
+The bridge function, sketched in [docs/bridge.md](docs/bridge.md) and yours to
+host. Any product specific telemetry, since the queries that matter are the ones
+about your own numbers. The rest of the agent roles you may want beyond the four
+cycles here. And a promise that this is safe to point at production on day one,
+which is what the dry run defaults, the branch protection step, and the read only
+database role are all there to earn.
 
 ## License
 
@@ -436,5 +365,5 @@ MIT. See [LICENSE](LICENSE).
 ---
 
 This is the sanitized skeleton of a system that has run daily against a
-production SaaS since July 2026, merging 40+ human-approved PRs. Built by
+production SaaS since July 2026, merging 30+ human-approved PRs. Built by
 Abdulrahman Mohamud (usepitlane.com).
